@@ -30,6 +30,8 @@ except Exception:
     _HAS_PYDICOM = False
 
 _ENTRY_PREFIX_MAX = 262144  # 256 KB cap for archive entry sniffing
+_NESTED_ARCHIVE_MAX = 10 * 1024 * 1024 * 1024  # 10 GB cap for reading nested archive entries
+_NESTED_EXTS = ('.zip', '.tar', '.tar.gz', '.tgz', '.tbz', '.tbz2', '.txz')
 
 # Simple instrumentation to report which paths were used
 _stats = {
@@ -99,6 +101,265 @@ def _is_dicom_via_pydicom(prefix_bytes: bytes) -> bool:
     except Exception:
         return False
 
+def _is_entry_dicom_or_dicom_archive(data: bytes, entry_name: str) -> bool:
+    """Return True if the entry is either a raw DICOM file or a nested archive
+    containing exclusively DICOM files.
+
+    Returns False if the entry is not DICOM and not a DICOM-only archive.
+    """
+    if not data:
+        return False
+
+    # 1. Check if this is a raw DICOM file
+    if len(data) >= 132 and data[128:132] == b'DICM':
+        return True
+    if _is_dicom_via_pydicom(data[:_ENTRY_PREFIX_MAX]):
+        return True
+
+    # 2. Check if this is a nested archive containing exclusively DICOM
+    entry_lower = entry_name.lower()
+    is_potential_nested = any(entry_lower.endswith(ext) for ext in _NESTED_EXTS)
+    if is_potential_nested:
+        return _nested_archive_is_all_dicom(data)
+
+    return False
+
+
+def _nested_archive_is_all_dicom(data: bytes) -> bool:
+    """Check if raw bytes represent a nested archive containing EXCLUSIVELY DICOM.
+
+    Returns True only if every file entry in the archive is DICOM.
+    Returns False if:
+      - the data is not a valid archive
+      - any entry is not DICOM
+      - the archive is empty
+    """
+    if not data:
+        return False
+
+    bio = io.BytesIO(data)
+    found_any_file = False
+
+    # Try as zip first (most common nested format for Flywheel/SCItran DICOM)
+    try:
+        with zipfile.ZipFile(bio) as zf:
+            for name in zf.namelist():
+                # Skip directory entries
+                if name.endswith('/'):
+                    continue
+                found_any_file = True
+                try:
+                    with zf.open(name) as f:
+                        prefix = f.read(131072)
+                        is_dcm = (
+                            (len(prefix) >= 132 and prefix[128:132] == b'DICM')
+                            or _is_dicom_via_pydicom(prefix)
+                        )
+                        if not is_dcm:
+                            return False  # non-DICOM entry found
+                except Exception:
+                    return False  # can't read entry, treat as non-DICOM
+            return found_any_file  # True only if at least one file and all were DICOM
+    except zipfile.BadZipFile:
+        pass
+    except Exception:
+        pass
+
+    # Try as tar
+    bio.seek(0)
+    found_any_file = False
+    try:
+        with tarfile.open(fileobj=bio) as tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+                found_any_file = True
+                f = tar.extractfile(member)
+                if f is None:
+                    return False
+                prefix = f.read(131072)
+                is_dcm = (
+                    (len(prefix) >= 132 and prefix[128:132] == b'DICM')
+                    or _is_dicom_via_pydicom(prefix)
+                )
+                if not is_dcm:
+                    # Could itself be a nested archive — check recursively
+                    member_lower = member.name.lower()
+                    if any(member_lower.endswith(ext) for ext in _NESTED_EXTS):
+                        try:
+                            f.seek(0)
+                            nested_data = f.read(_NESTED_ARCHIVE_MAX)
+                            if not _nested_archive_is_all_dicom(nested_data):
+                                return False
+                        except Exception:
+                            return False
+                    else:
+                        return False  # non-DICOM, non-archive entry
+            return found_any_file
+    except tarfile.ReadError:
+        pass
+    except Exception:
+        pass
+
+    return False
+
+
+def _check_archive_with_libarchive(archive_path):
+    """Return (all_dicom, is_corrupted) by streaming entries with libarchive.
+
+    Returns all_dicom=True only if the archive is non-empty and EVERY file entry
+    is either a raw DICOM or a nested archive containing exclusively DICOM.
+    """
+    if not _HAS_LIBARCHIVE:
+        return False, False
+
+    try:
+        found_any_file = False
+        with libarchive_file_reader(archive_path) as entries:
+            for entry in entries:
+                entry_name = getattr(entry, 'pathname', '') or ''
+                entry_lower = entry_name.lower()
+                is_potential_nested = any(entry_lower.endswith(ext) for ext in _NESTED_EXTS)
+
+                if is_potential_nested:
+                    entry_size = getattr(entry, 'size', 0) or 0
+                    if entry_size > _NESTED_ARCHIVE_MAX:
+                        _stats['archive_entries_checked'] += 1
+                        return False, False  # entry too large to verify → not safe to list
+                    max_read = entry_size if entry_size > 0 else _NESTED_ARCHIVE_MAX
+                else:
+                    max_read = _ENTRY_PREFIX_MAX
+
+                # Accumulate entry bytes
+                buf = bytearray()
+                try:
+                    for block in entry.get_blocks():
+                        if len(buf) >= max_read:
+                            break
+                        need = max_read - len(buf)
+                        buf.extend(block[:need])
+                except Exception:
+                    _stats['archive_entries_checked'] += 1
+                    return False, False  # can't read entry → not safe
+
+                data = bytes(buf)
+                if not data:
+                    # Skip zero-length entries (e.g. directory entries)
+                    continue
+
+                found_any_file = True
+                _stats['archive_entries_checked'] += 1
+
+                if not _is_entry_dicom_or_dicom_archive(data, entry_name):
+                    return False, False  # non-DICOM entry found → reject
+
+        if found_any_file:
+            _stats['archive_libarchive'] += 1
+        return found_any_file, False
+    except Exception as e:
+        err_msg = str(e)
+        if 'Unrecognized archive format' in err_msg:
+            return False, False
+        print(f"Error reading archive {archive_path}: {e}")
+        return False, True
+
+def _check_tar_or_zip_fallback(archive_path):
+    """Fallback for when libarchive isn't available.
+
+    Returns (all_dicom, is_corrupted).
+    all_dicom is True only if every file entry is DICOM or a DICOM-only nested archive.
+    """
+    # Try tar-like
+    try:
+        found_any_file = False
+        with tarfile.open(archive_path) as tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+                found_any_file = True
+                f = tar.extractfile(member)
+                if f is None:
+                    return False, False  # can't read → not safe
+                _stats['archive_entries_checked'] += 1
+
+                # Check if raw DICOM
+                is_dcm = False
+                if _has_dicom_magic_at_128(f):
+                    is_dcm = True
+                if not is_dcm:
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+                    prefix = f.read(131072)
+                    if _is_dicom_via_pydicom(prefix):
+                        is_dcm = True
+
+                if not is_dcm:
+                    # Check if entry is a nested archive containing exclusively DICOM
+                    member_lower = member.name.lower()
+                    if any(member_lower.endswith(ext) for ext in _NESTED_EXTS) and member.size <= _NESTED_ARCHIVE_MAX:
+                        try:
+                            f.seek(0)
+                            full_data = f.read(member.size)
+                            if _nested_archive_is_all_dicom(full_data):
+                                is_dcm = True
+                        except Exception:
+                            pass
+
+                if not is_dcm:
+                    return False, False  # non-DICOM entry → reject archive
+
+        if found_any_file:
+            _stats['archive_fallback'] += 1
+        return found_any_file, False
+    except tarfile.ReadError:
+        pass
+    except Exception as e:
+        print(f"Error reading tar archive {archive_path}: {e}")
+        return False, True
+
+    # Try zip
+    try:
+        found_any_file = False
+        with zipfile.ZipFile(archive_path) as zf:
+            for name in zf.namelist():
+                if name.endswith('/'):
+                    continue  # directory entry
+                found_any_file = True
+                with zf.open(name) as f:
+                    prefix = f.read(131072)
+                    _stats['archive_entries_checked'] += 1
+
+                    is_dcm = (
+                        (len(prefix) >= 132 and prefix[128:132] == b'DICM')
+                        or _is_dicom_via_pydicom(prefix)
+                    )
+
+                    if not is_dcm:
+                        # Check if entry is a nested archive containing exclusively DICOM
+                        name_lower = name.lower()
+                        if any(name_lower.endswith(ext) for ext in _NESTED_EXTS):
+                            try:
+                                rest = f.read(_NESTED_ARCHIVE_MAX - len(prefix))
+                                full_data = prefix + rest
+                                if _nested_archive_is_all_dicom(full_data):
+                                    is_dcm = True
+                            except Exception:
+                                pass
+
+                    if not is_dcm:
+                        return False, False  # non-DICOM entry → reject archive
+
+        if found_any_file:
+            _stats['archive_fallback'] += 1
+        return found_any_file, False
+    except zipfile.BadZipFile:
+        return False, False
+    except Exception as e:
+        print(f"Error reading zip archive {archive_path}: {e}")
+        return False, True
+    
 
 def is_dicom_file(filepath):
     """Robust DICOM detection for raw files with minimal I/O.
@@ -120,127 +381,20 @@ def is_dicom_file(filepath):
     except Exception:
         return False
 
-def is_dicom_file(filepath):
-    try:
-        with open(filepath, 'rb') as f:
-            return is_dicom_bytes(f)
-    except Exception:
-        return False
 
-def _check_archive_with_libarchive(archive_path):
-    """Return (has_dicom, is_corrupted) by streaming entries with libarchive.
-
-    Reads up to `_ENTRY_PREFIX_MAX` per entry and probes via pydicom and magic.
-    No extraction to disk.
-    """
-    if not _HAS_LIBARCHIVE:
-        return False, False
-
-    try:
-        # libarchive yields entries; we read blocks from each without extracting
-        with libarchive_file_reader(archive_path) as entries:
-            for entry in entries:
-                # Accumulate a limited prefix for probing
-                prefix = bytearray()
-                try:
-                    for block in entry.get_blocks():
-                        if len(prefix) >= _ENTRY_PREFIX_MAX:
-                            break
-                        need = _ENTRY_PREFIX_MAX - len(prefix)
-                        prefix.extend(block[:need])
-                        # Early exit if we already have enough for magic check
-                        if len(prefix) >= 132:
-                            # Quick magic check on available bytes
-                            if len(prefix) >= 132 and prefix[128:132] == b'DICM':
-                                _stats['archive_libarchive'] += 1
-                                _stats['archive_entries_checked'] += 1
-                                return True, False
-                    # After gathering prefix, try pydicom-based probe
-                    if prefix and _is_dicom_via_pydicom(bytes(prefix)):
-                        _stats['archive_libarchive'] += 1
-                        _stats['archive_entries_checked'] += 1
-                        return True, False
-                except Exception:
-                    # Skip problematic entry but continue archive
-                    _stats['archive_entries_checked'] += 1
-                    continue
-        return False, False
-    except Exception as e:
-        print(f"Error reading archive {archive_path}: {e}")
-        return False, True
-
-def _check_tar_or_zip_fallback(archive_path):
-    """Fallback for when libarchive isn't available.
-
-    Supports common tar(.gz/.tgz) and zip via stdlib, reading only needed bytes.
-    Returns (has_dicom, is_corrupted).
-    """
-    # Try tar-like
-    try:
-        with tarfile.open(archive_path) as tar:
-            for member in tar.getmembers():
-                if not member.isfile():
-                    continue
-                f = tar.extractfile(member)
-                if f is None:
-                    continue
-                # Probe magic quickly
-                if _has_dicom_magic_at_128(f):
-                    _stats['archive_fallback'] += 1
-                    _stats['archive_entries_checked'] += 1
-                    return True, False
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                prefix = f.read(131072)
-                if _is_dicom_via_pydicom(prefix):
-                    _stats['archive_fallback'] += 1
-                    _stats['archive_entries_checked'] += 1
-                    return True, False
-        return False, False
-    except tarfile.ReadError:
-        # Not a tar archive
-        pass
-    except Exception as e:
-        print(f"Error reading tar archive {archive_path}: {e}")
-        return False, True
-
-    # Try zip
-    try:
-        with zipfile.ZipFile(archive_path) as zf:
-            for name in zf.namelist():
-                with zf.open(name) as f:
-                    # For zip files, we can't seek backwards in compressed stream; read prefix
-                    prefix = f.read(131072)
-                    # Quick magic if we have enough
-                    if len(prefix) >= 132 and prefix[128:132] == b'DICM':
-                        _stats['archive_fallback'] += 1
-                        _stats['archive_entries_checked'] += 1
-                        return True, False
-                    if _is_dicom_via_pydicom(prefix):
-                        _stats['archive_fallback'] += 1
-                        _stats['archive_entries_checked'] += 1
-                        return True, False
-        return False, False
-    except zipfile.BadZipFile:
-        # Not a zip archive
-        return False, False
-    except Exception as e:
-        print(f"Error reading zip archive {archive_path}: {e}")
-        return False, True
 
 def find_dicoms_and_archives_with_dicoms(root_dir):
     """
-    Walk the tree and:
-      - If a directory contains ONLY .dcm files (and at least one), record the directory path once (aggregated).
-      - Otherwise, record individual DICOM file paths (.dcm) found (that are not in an all-dcm directory case).
-      - For archives (.tar/.tar.gz/.tgz/.zip) that contain any DICOM, record only the archive path.
-    Returns:
-      aggregated_dirs: list of directory paths aggregated
-      dicom_files: list of individual DICOM file paths
-      archives: list of archive paths containing DICOM(s)
-      corrupted_archives: list of corrupted archive paths
+    Walk the tree and classify files for safe DICOM-only deletion:
+      - aggregated_dirs: directories where ALL visible files are raw DICOM.
+      - dicom_files: individual raw DICOM files in mixed (non-all-DICOM) directories.
+      - archives: archive files whose contents are EXCLUSIVELY DICOM
+        (including nested archives like tar → zip → .dcm).
+      - corrupted_archives: archives that could not be read.
+
+    An archive is only listed if EVERY file entry inside it (recursively through
+    nested archives) is a valid DICOM file.  Archives containing any non-DICOM
+    data are silently skipped to prevent accidental data loss.
     """
     aggregated_dirs = []
     dicom_files = []
@@ -257,16 +411,22 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
         # Check archives for DICOM content using libarchive if available; otherwise fallback
         for filename in visible_files:
             filepath = os.path.join(dirpath, filename)
-            # Prefer quick extension filter to reduce needless probing, but don't rely solely on it
+            # Only attempt archive detection on files whose extension looks like an archive
             lower = filename.lower()
-            looks_archive = lower.endswith((
-                '.tar', '.tar.gz', '.tgz', '.tbz', '.tbz2', '.txz', '.zip', '.gz', '.bz2', '.xz', '.7z'
-            ))
+            # Exclude domain-specific compressed formats that aren't true archives
+            is_neuroimaging_compressed = lower.endswith(('.nii.gz', '.nii.bz2', '.nii.xz'))
+            looks_archive = (
+                lower.endswith((
+                    '.tar', '.tar.gz', '.tgz', '.tbz', '.tbz2', '.txz',
+                    '.zip', '.gz', '.bz2', '.xz', '.7z',
+                ))
+                and not is_neuroimaging_compressed
+            )
 
             has_dicom = False
             is_corrupted = False
 
-            if looks_archive or _HAS_LIBARCHIVE:
+            if looks_archive:
                 if _HAS_LIBARCHIVE:
                     has_dicom, is_corrupted = _check_archive_with_libarchive(filepath)
                 else:
@@ -303,23 +463,28 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
     
     return aggregated_dirs, dicom_files, archives, corrupted_archives
 
-def write_results_to_csv(output_file, aggregated_dirs, dicom_files, archives, corrupted_archives):
-    """Write the results to a CSV file."""
+def write_results_to_csv(output_file, root_dir, aggregated_dirs, dicom_files, archives, corrupted_archives):
+    """Write the results to a CSV file.
+
+    Each row contains the type, the root directory, and the path relative to
+    root_dir so that a downstream script can reconstruct the full path as
+    os.path.join(root, relative_path) and preserve folder structure when moving.
+    """
     with open(output_file, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Type', 'Path'])
+        writer.writerow(['Type', 'Root', 'RelativePath'])
         
         for dir_path in aggregated_dirs:
-            writer.writerow(['aggregated_directory', dir_path])
+            writer.writerow(['aggregated_directory', root_dir, os.path.relpath(dir_path, root_dir)])
         
         for file_path in dicom_files:
-            writer.writerow(['individual_dicom', file_path])
+            writer.writerow(['individual_dicom', root_dir, os.path.relpath(file_path, root_dir)])
         
         for archive_path in archives:
-            writer.writerow(['archive_with_dicom', archive_path])
+            writer.writerow(['all_dicom_archive', root_dir, os.path.relpath(archive_path, root_dir)])
         
         for corrupt_path in corrupted_archives:
-            writer.writerow(['corrupted_archive', corrupt_path])
+            writer.writerow(['corrupted_archive', root_dir, os.path.relpath(corrupt_path, root_dir)])
 
 def main():
     import sys
@@ -342,7 +507,7 @@ def main():
     aggregated_dirs, dicom_files, archives, corrupted_archives = find_dicoms_and_archives_with_dicoms(root_dir)
     
     # Write results to CSV
-    write_results_to_csv(output_csv, aggregated_dirs, dicom_files, archives, corrupted_archives)
+    write_results_to_csv(output_csv, root_dir, aggregated_dirs, dicom_files, archives, corrupted_archives)
     
     # Print summary
     print(f"Found {len(aggregated_dirs)} aggregated directories with only DICOM files")
