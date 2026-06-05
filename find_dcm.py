@@ -3,6 +3,16 @@ import io
 import tarfile
 import zipfile
 import csv
+import stat as stat_mod
+from collections import defaultdict
+
+# Unix-only modules for resolving owner/group names
+try:
+    import pwd
+    import grp
+    _HAS_UNIX_OWNER = True
+except ImportError:
+    _HAS_UNIX_OWNER = False
 
 # Optional deps for comprehensive detection
 try:
@@ -400,8 +410,17 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
     dicom_files = []
     archives = []
     corrupted_archives = []
+    permission_errors = []
 
-    for dirpath, _, files in os.walk(root_dir):
+    def _walk_onerror(err):
+        """Callback for os.walk when it cannot list a directory."""
+        if isinstance(err, PermissionError):
+            permission_errors.append(err.filename or str(err))
+            print(f"Permission denied: {err.filename}")
+        else:
+            print(f"Error walking directory: {err}")
+
+    for dirpath, _, files in os.walk(root_dir, onerror=_walk_onerror):
         # Consider only regular file names (ignore hidden for aggregation test)
         visible_files = [f for f in files if not f.startswith('.')]
         
@@ -414,7 +433,14 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
             # Only attempt archive detection on files whose extension looks like an archive
             lower = filename.lower()
             # Exclude domain-specific compressed formats that aren't true archives
-            is_neuroimaging_compressed = lower.endswith(('.nii.gz', '.nii.bz2', '.nii.xz'))
+            # .nii.gz          — NIfTI neuroimaging
+            # .fib.gz          — DSI Studio fiber file
+            # .src.gz          — DSI Studio source file
+            # .qc.txt          — (not .gz, won't match, but listed for docs)
+            is_neuroimaging_compressed = lower.endswith((
+                '.nii.gz', '.nii.bz2', '.nii.xz',
+                '.fib.gz', '.src.gz',
+            ))
             looks_archive = (
                 lower.endswith((
                     '.tar', '.tar.gz', '.tgz', '.tbz', '.tbz2', '.txz',
@@ -427,11 +453,16 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
             is_corrupted = False
 
             if looks_archive:
-                if _HAS_LIBARCHIVE:
-                    has_dicom, is_corrupted = _check_archive_with_libarchive(filepath)
-                else:
-                    # Use stdlib fallback for common formats
-                    has_dicom, is_corrupted = _check_tar_or_zip_fallback(filepath)
+                try:
+                    if _HAS_LIBARCHIVE:
+                        has_dicom, is_corrupted = _check_archive_with_libarchive(filepath)
+                    else:
+                        # Use stdlib fallback for common formats
+                        has_dicom, is_corrupted = _check_tar_or_zip_fallback(filepath)
+                except PermissionError:
+                    permission_errors.append(filepath)
+                    print(f"Permission denied: {filepath}")
+                    continue
 
                 if is_corrupted:
                     corrupted_archives.append(filepath)
@@ -451,7 +482,14 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
                 # If we've already classified it as an archive with dicoms, skip
                 if filepath in archives or filepath in corrupted_archives:
                     continue
-                if is_dicom_file(filepath):
+                try:
+                    is_dcm = is_dicom_file(filepath)
+                except PermissionError:
+                    permission_errors.append(filepath)
+                    print(f"Permission denied: {filepath}")
+                    non_dicom_files_in_dir.append(filepath)  # treat as non-DICOM to be safe
+                    continue
+                if is_dcm:
                     dicom_files_in_dir.append(filepath)
                 else:
                     non_dicom_files_in_dir.append(filepath)
@@ -461,9 +499,9 @@ def find_dicoms_and_archives_with_dicoms(root_dir):
             else:
                 dicom_files.extend(dicom_files_in_dir)
     
-    return aggregated_dirs, dicom_files, archives, corrupted_archives
+    return aggregated_dirs, dicom_files, archives, corrupted_archives, permission_errors
 
-def write_results_to_csv(output_file, root_dir, aggregated_dirs, dicom_files, archives, corrupted_archives):
+def write_results_to_csv(output_file, root_dir, aggregated_dirs, dicom_files, archives, corrupted_archives, permission_errors):
     """Write the results to a CSV file.
 
     Each row contains the type, the root directory, and the path relative to
@@ -485,16 +523,109 @@ def write_results_to_csv(output_file, root_dir, aggregated_dirs, dicom_files, ar
         
         for corrupt_path in corrupted_archives:
             writer.writerow(['corrupted_archive', root_dir, os.path.relpath(corrupt_path, root_dir)])
+        
+        for perm_path in permission_errors:
+            writer.writerow(['permission_denied', root_dir, os.path.relpath(perm_path, root_dir)])
+
+
+def _resolve_owner(path):
+    """Best-effort resolution of the owner and group of *path*.
+
+    Falls back to the parent directory if *path* itself is inaccessible
+    (which is the common case for permission-denied entries).
+    Returns (username, groupname, uid, gid, octal_mode).
+    """
+    for target in (path, os.path.dirname(path)):
+        try:
+            st = os.stat(target)
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+        uid, gid = st.st_uid, st.st_gid
+        mode = stat_mod.filemode(st.st_mode)
+        if _HAS_UNIX_OWNER:
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                user = str(uid)
+            try:
+                group = grp.getgrgid(gid).gr_name
+            except KeyError:
+                group = str(gid)
+        else:
+            user, group = str(uid), str(gid)
+        return user, group, uid, gid, mode
+    return 'unknown', 'unknown', -1, -1, '??????????'
+
+
+def write_permission_report(report_path, root_dir, permission_errors):
+    """Write a human-readable permission report grouped by owner.
+
+    The file is intended to be forwarded to file owners or sysadmins so
+    they can adjust permissions (e.g. ``chmod g+rX`` or ACL changes).
+    It also writes a companion CSV (<report_path>.csv) for programmatic use.
+    """
+    if not permission_errors:
+        return
+
+    # Resolve ownership for each path
+    by_owner = defaultdict(list)  # (user,group) -> [(path, mode)]
+    records = []  # for CSV
+    for p in sorted(permission_errors):
+        user, group, uid, gid, mode = _resolve_owner(p)
+        rel = os.path.relpath(p, root_dir)
+        by_owner[(user, group)].append((rel, mode))
+        records.append((user, group, uid, gid, mode, rel))
+
+    # ---- human-readable report ----
+    with open(report_path, 'w') as f:
+        f.write('=' * 72 + '\n')
+        f.write('PERMISSION-DENIED SUMMARY REPORT\n')
+        f.write(f'Root searched : {root_dir}\n')
+        f.write(f'Total blocked : {len(permission_errors)} path(s)\n')
+        f.write(f'Unique owners : {len(by_owner)}\n')
+        f.write('=' * 72 + '\n\n')
+
+        for (user, group), entries in sorted(by_owner.items(),
+                                              key=lambda kv: (-len(kv[1]), kv[0])):
+            f.write(f'--- Owner: {user}  Group: {group}  '
+                    f'({len(entries)} path(s)) ---\n')
+            for rel, mode in entries:
+                f.write(f'  {mode}  {rel}\n')
+            f.write('\n')
+
+        f.write('-' * 72 + '\n')
+        f.write('Suggested fix (run as owner or root):\n')
+        f.write('  chmod -R g+rX <path>   # grant group read+traverse\n')
+        f.write('  # or use setfacl for finer-grained control:\n')
+        f.write('  # setfacl -R -m g:<your_group>:rX <path>\n')
+
+    # ---- companion CSV ----
+    csv_path = report_path + '.csv'
+    with open(csv_path, 'w', newline='') as cf:
+        writer = csv.writer(cf)
+        writer.writerow(['Owner', 'Group', 'UID', 'GID', 'Mode', 'RelativePath'])
+        for rec in records:
+            writer.writerow(rec)
+
+    return report_path, csv_path
+
 
 def main():
     import sys
     
-    if len(sys.argv) != 3:
-        print("Usage: python find_dcm.py <root_directory> <output_csv>")
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        print("Usage: python find_dcm.py <root_directory> <output_csv> [permission_report]")
+        print("  permission_report : optional path for the permission-denied summary")
+        print("                     (defaults to <output_csv_stem>_permissions.txt)")
         sys.exit(1)
     
     root_dir = sys.argv[1]
     output_csv = sys.argv[2]
+    if len(sys.argv) == 4:
+        perm_report = sys.argv[3]
+    else:
+        stem, _ = os.path.splitext(output_csv)
+        perm_report = stem + '_permissions.txt'
     
     if not os.path.exists(root_dir):
         print(f"Error: Root directory '{root_dir}' does not exist.")
@@ -504,16 +635,24 @@ def main():
     print(f"Output will be written to: {output_csv}")
     
     # Find DICOM files and archives
-    aggregated_dirs, dicom_files, archives, corrupted_archives = find_dicoms_and_archives_with_dicoms(root_dir)
+    aggregated_dirs, dicom_files, archives, corrupted_archives, permission_errors = find_dicoms_and_archives_with_dicoms(root_dir)
     
     # Write results to CSV
-    write_results_to_csv(output_csv, root_dir, aggregated_dirs, dicom_files, archives, corrupted_archives)
+    write_results_to_csv(output_csv, root_dir, aggregated_dirs, dicom_files, archives, corrupted_archives, permission_errors)
     
+    # Write permission report
+    if permission_errors:
+        txt_path, csv_perm_path = write_permission_report(
+            perm_report, root_dir, permission_errors)
+        print(f"Permission report written to: {txt_path}")
+        print(f"Permission CSV written to  : {csv_perm_path}")
+
     # Print summary
     print(f"Found {len(aggregated_dirs)} aggregated directories with only DICOM files")
     print(f"Found {len(dicom_files)} individual DICOM files")
     print(f"Found {len(archives)} archives containing DICOM files")
     print(f"Found {len(corrupted_archives)} corrupted archives")
+    print(f"Found {len(permission_errors)} paths with permission denied")
     print(f"Results written to: {output_csv}")
 
     # Report detection modes used

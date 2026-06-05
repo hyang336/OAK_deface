@@ -2,21 +2,34 @@
 """
 Generate a job list file for the find_dcm SLURM array job.
 This script creates a text file where each line contains a path to process.
+Supports filtering by file owner (useful for group directories).
 """
 
 import os
 import sys
 import argparse
+import pwd
 
 
-def generate_job_list(parent_dir, output_dir):
+def generate_job_list(parent_dir, output_dir, owner=None):
     """
     Generate a list of all directories and files in the parent directory.
     Each item will be processed as a separate job in the SLURM array.
+
+    If owner is given (username string), only items owned by that user are included.
     """
     if not os.path.exists(parent_dir):
         print(f"Error: Parent directory '{parent_dir}' does not exist.")
         sys.exit(1)
+
+    # Resolve owner UID once if filtering
+    owner_uid = None
+    if owner:
+        try:
+            owner_uid = pwd.getpwnam(owner).pw_uid
+        except KeyError:
+            print(f"Error: user '{owner}' not found on this system.")
+            sys.exit(1)
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -28,6 +41,13 @@ def generate_job_list(parent_dir, output_dir):
         # Get all items (files and directories) in the parent directory
         for item in os.listdir(parent_dir):
             item_path = os.path.join(parent_dir, item)
+            # Filter by owner if requested
+            if owner_uid is not None:
+                try:
+                    if os.stat(item_path).st_uid != owner_uid:
+                        continue
+                except OSError:
+                    continue  # skip items we can't stat
             # Add both files and directories to the processing list
             items_to_process.append(item_path)
         
@@ -62,10 +82,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
-  python generate_job_list.py /oak/stanford/groups/awagner/AM /scratch/users/hyang336/dcm_results
+  python generate_job_list.py /oak/stanford/groups/awagner /scratch/users/hyang336/dcm_results --owner hyang336
   
 This will create a job_list.txt file in the output directory, then you can run:
-  sbatch --array=1-N find_dcm.sbatch /oak/stanford/groups/awagner/AM /scratch/users/hyang336/dcm_results
+  sbatch --array=1-N find_dcm.sbatch /scratch/users/hyang336/dcm_results/job_list.txt /scratch/users/hyang336/dcm_results
   
 where N is the number printed by this script.
         """
@@ -73,10 +93,12 @@ where N is the number printed by this script.
     
     parser.add_argument("parent_dir", help="Parent directory to scan for subdirectories and files")
     parser.add_argument("output_dir", help="Directory where job list and results will be written")
+    parser.add_argument("--owner", default=None,
+                        help="Only include items owned by this username (default: include all)")
     
     args = parser.parse_args()
     
-    generate_job_list(args.parent_dir, args.output_dir)
+    generate_job_list(args.parent_dir, args.output_dir, owner=args.owner)
 
 
 if __name__ == "__main__":
