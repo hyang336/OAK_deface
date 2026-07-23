@@ -51,6 +51,8 @@ import os
 import re
 import stat as stat_mod
 import sys
+import tarfile
+import zipfile
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
@@ -305,12 +307,100 @@ def _classify(filepath: str, fmt: str, use_nibabel: bool = True):
 
 
 # ---------------------------------------------------------------------------
+# Archive inspection
+# ---------------------------------------------------------------------------
+
+# Compound extensions must be checked before single extensions.
+_ARCHIVE_COMPOUND_EXTS = ['.tar.gz', '.tar.bz2', '.tar.xz']
+_ARCHIVE_SINGLE_EXTS   = ['.tgz', '.tbz2', '.txz', '.tar', '.zip']
+
+
+def _get_archive_type(filename):
+    """Return 'tar' or 'zip' if *filename* is a recognised archive, else None."""
+    lower = filename.lower()
+    for ext in _ARCHIVE_COMPOUND_EXTS:
+        if lower.endswith(ext):
+            return 'tar'
+    for ext in _ARCHIVE_SINGLE_EXTS:
+        if lower.endswith(ext):
+            return 'zip' if ext == '.zip' else 'tar'
+    return None
+
+
+def find_in_archive(archive_path, arch_type):
+    """Inspect *archive_path* and return (records, permission_errors).
+
+    Member filenames are classified using filename and path patterns only;
+    nibabel cannot be used without extracting the entry.  Each returned
+    record contains the same keys as a regular record plus 'archive_member'
+    (the member's path within the archive).
+    """
+    records = []
+    errors  = []
+    try:
+        if arch_type == 'zip':
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                for member_name in zf.namelist():
+                    basename = os.path.basename(member_name)
+                    if not basename or basename.startswith('.'):
+                        continue
+                    fmt, _ = _get_format(basename)
+                    if fmt is None:
+                        continue
+                    confidence, reason, _ = _classify(member_name, fmt, use_nibabel=False)
+                    records.append({
+                        'filepath':       archive_path,
+                        'archive_member': member_name,
+                        'format':         fmt,
+                        'confidence':     confidence,
+                        'match_reason':   reason,
+                        'dimensions':     '',
+                    })
+        else:
+            # handles .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz
+            with tarfile.open(archive_path, 'r:*') as tf:
+                for member in tf.getmembers():
+                    if member.isdir():
+                        continue
+                    basename = os.path.basename(member.name)
+                    if not basename or basename.startswith('.'):
+                        continue
+                    fmt, _ = _get_format(basename)
+                    if fmt is None:
+                        continue
+                    confidence, reason, _ = _classify(member.name, fmt, use_nibabel=False)
+                    records.append({
+                        'filepath':       archive_path,
+                        'archive_member': member.name,
+                        'format':         fmt,
+                        'confidence':     confidence,
+                        'match_reason':   reason,
+                        'dimensions':     '',
+                    })
+    except PermissionError:
+        errors.append(archive_path)
+        print(f"Permission denied (archive): {archive_path}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Error inspecting archive {archive_path}: {exc}", file=sys.stderr)
+        records.append({
+            'filepath':       archive_path,
+            'archive_member': '',
+            'format':         '',
+            'confidence':     'archive_unreadable',
+            'match_reason':   str(exc),
+            'dimensions':     '',
+        })
+    return records, errors
+
+
+# ---------------------------------------------------------------------------
 # Directory walk
 # ---------------------------------------------------------------------------
 
 def find_structural_files(root_dir, use_nibabel=True,
                           include_unclassified=False,
-                          include_non_structural=False):
+                          include_non_structural=False,
+                          inspect_archives=True):
     """Walk *root_dir* and return lists of classified neuroimaging files.
 
     Returns
@@ -318,16 +408,34 @@ def find_structural_files(root_dir, use_nibabel=True,
     high_conf, medium_conf, unclassified, non_structural,
     pet_high, pet_medium, permission_errors
       Each element is a list of dicts with keys:
-        filepath, format, confidence, match_reason, dimensions
+        filepath, archive_member, format, confidence, match_reason, dimensions
       permission_errors is a list of path strings.
     """
-    high_conf        = []
-    medium_conf      = []
-    unclassified_lst = []
-    non_structural   = []
-    pet_high         = []
-    pet_medium       = []
-    permission_errors = []
+    high_conf          = []
+    medium_conf        = []
+    unclassified_lst   = []
+    non_structural     = []
+    pet_high           = []
+    pet_medium         = []
+    archives_unreadable = []
+    permission_errors  = []
+
+    def _route(record):
+        confidence = record['confidence']
+        if confidence == 'high':
+            high_conf.append(record)
+        elif confidence == 'medium':
+            medium_conf.append(record)
+        elif confidence == 'pet_high':
+            pet_high.append(record)
+        elif confidence == 'pet_medium':
+            pet_medium.append(record)
+        elif confidence == 'non_structural':
+            non_structural.append(record)
+        elif confidence == 'archive_unreadable':
+            archives_unreadable.append(record)
+        else:
+            unclassified_lst.append(record)
 
     def _walk_onerror(err):
         if isinstance(err, PermissionError):
@@ -344,44 +452,91 @@ def find_structural_files(root_dir, use_nibabel=True,
             if fname.startswith('.'):
                 continue
 
-            fmt, _ = _get_format(fname)
-            if fmt is None:
-                continue  # not a recognised neuroimaging format
-
             filepath = os.path.join(dirpath, fname)
 
-            try:
-                confidence, reason, dims = _classify(filepath, fmt, use_nibabel)
-            except PermissionError:
-                permission_errors.append(filepath)
-                print(f"Permission denied: {filepath}", file=sys.stderr)
+            # ---- Direct neuroimaging file ----
+            fmt, _ = _get_format(fname)
+            if fmt is not None:
+                try:
+                    confidence, reason, dims = _classify(filepath, fmt, use_nibabel)
+                except PermissionError:
+                    permission_errors.append(filepath)
+                    print(f"Permission denied: {filepath}", file=sys.stderr)
+                    continue
+                except Exception as exc:
+                    print(f"Error classifying {filepath}: {exc}", file=sys.stderr)
+                    continue
+                _route({
+                    'filepath':       filepath,
+                    'archive_member': '',
+                    'format':         fmt,
+                    'confidence':     confidence,
+                    'match_reason':   reason,
+                    'dimensions':     dims,
+                })
                 continue
-            except Exception as exc:
-                print(f"Error classifying {filepath}: {exc}", file=sys.stderr)
-                continue
 
-            record = {
-                'filepath':    filepath,
-                'format':      fmt,
-                'confidence':  confidence,
-                'match_reason': reason,
-                'dimensions':  dims,
-            }
+            # ---- Archive inspection ----
+            if inspect_archives:
+                arch_type = _get_archive_type(fname)
+                if arch_type is not None:
+                    arch_records, arch_errors = find_in_archive(filepath, arch_type)
+                    permission_errors.extend(arch_errors)
+                    for record in arch_records:
+                        _route(record)
 
-            if confidence == 'high':
-                high_conf.append(record)
-            elif confidence == 'medium':
-                medium_conf.append(record)
-            elif confidence == 'pet_high':
-                pet_high.append(record)
-            elif confidence == 'pet_medium':
-                pet_medium.append(record)
-            elif confidence == 'non_structural':
-                non_structural.append(record)
-            else:
-                unclassified_lst.append(record)
+    return high_conf, medium_conf, unclassified_lst, non_structural, pet_high, pet_medium, archives_unreadable, permission_errors
 
-    return high_conf, medium_conf, unclassified_lst, non_structural, pet_high, pet_medium, permission_errors
+
+# ---------------------------------------------------------------------------
+# mri_reface imType mapping
+# ---------------------------------------------------------------------------
+
+def _get_imtype(basename: str, confidence: str) -> str:
+    """Return the mri_reface -imType value for a neuroimaging filename.
+
+    Returns one of the types explicitly supported by mri_reface:
+      T1 | T2 | PD | T2ST | FLAIR | FDG | PIB | FBP | TAU
+    Returns empty string '' if the modality cannot be determined.
+    Callers must route empty-string results to DELETE rather than DEFACE;
+    passing AUTO to mri_reface is unreliable — it just checks the filename
+    for recognised suffixes and errors if none match.
+    """
+    b = basename.lower()
+    # T2* must be checked before plain T2 to avoid false match
+    if re.search(r'_t2starw|_t2star', b):                     return 'T2ST'
+    # BIDS / explicit suffixes — highest specificity first
+    if re.search(r'_flair(?:\.|$)', b):                       return 'FLAIR'
+    if re.search(r'_pdw(?:\.|$)', b):                         return 'PD'
+    # T1-weighted sequences and scanner trade names
+    if re.search(r'_t1w|_t1rho|_inplanet1'
+                 r'|mprage|mp2rage|memp2rage|memprage'
+                 r'|\bspgr\b|\bflash\b|\bgre\b|\bbravo\b|ir-fspgr', b):
+        return 'T1'
+    # T2-weighted
+    if re.search(r'_t2w|_inplanet2', b):                      return 'T2'
+    # PET tracers with known mri_reface types
+    if confidence in ('pet_high', 'pet_medium'):
+        if re.search(r'\bfdg\b', b):                          return 'FDG'
+        if re.search(r'\bpib\b', b):                          return 'PIB'
+        if re.search(r'florbetapir|florbetaben|flutemetamol|\bav.?45\b', b):
+            return 'FBP'
+        if re.search(r'flortaucipir|mk.?6240|av.?1451', b):   return 'TAU'
+    # Medium-confidence fallbacks (word-boundary matches)
+    if re.search(r'\bt1\b', b):                               return 'T1'
+    if re.search(r'\bt2\b', b):                               return 'T2'
+    if re.search(r'\bflair\b', b):                            return 'FLAIR'
+    if re.search(r'\bpd\b', b):                               return 'PD'
+    # Modality unknown — caller should route to DELETE, not DEFACE
+    return ''
+
+
+def _imtype_for_record(rec: dict) -> str:
+    """Derive the mri_reface imType for a classification record."""
+    fname = (os.path.basename(rec['archive_member'])
+             if rec.get('archive_member')
+             else os.path.basename(rec['filepath']))
+    return _get_imtype(fname, rec['confidence'])
 
 
 # ---------------------------------------------------------------------------
@@ -392,19 +547,22 @@ def write_results_to_csv(output_file, root_dir,
                          high_conf, medium_conf,
                          unclassified_lst, non_structural,
                          pet_high, pet_medium,
+                         archives_unreadable,
                          permission_errors,
                          include_unclassified=False,
                          include_non_structural=False):
     """Write classified results to *output_file* in the same schema as find_dcm.py.
 
-    Columns: Type, Root, RelativePath, Format, MatchReason, Dimensions
+    Columns: Type, Root, RelativePath, Format, MatchReason, Dimensions, ArchiveMember
 
-    PET records are always written. Structural unclassified and non_structural
-    records are written only when the corresponding flag is True.
+    PET and archive_unreadable records are always written. Structural
+    unclassified and non_structural records are written only when the
+    corresponding flag is True.
     """
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     with open(output_file, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Type', 'Root', 'RelativePath', 'Format', 'MatchReason', 'Dimensions'])
+        writer.writerow(['Type', 'Root', 'RelativePath', 'Format', 'MatchReason', 'ImType', 'Dimensions', 'ArchiveMember'])
 
         for rec in high_conf:
             writer.writerow([
@@ -413,7 +571,9 @@ def write_results_to_csv(output_file, root_dir,
                 os.path.relpath(rec['filepath'], root_dir),
                 rec['format'],
                 rec['match_reason'],
+                _imtype_for_record(rec),
                 rec['dimensions'],
+                rec.get('archive_member', ''),
             ])
 
         for rec in medium_conf:
@@ -423,7 +583,9 @@ def write_results_to_csv(output_file, root_dir,
                 os.path.relpath(rec['filepath'], root_dir),
                 rec['format'],
                 rec['match_reason'],
+                _imtype_for_record(rec),
                 rec['dimensions'],
+                rec.get('archive_member', ''),
             ])
 
         # PET records always written (needed for downstream mri_reface processing)
@@ -434,7 +596,9 @@ def write_results_to_csv(output_file, root_dir,
                 os.path.relpath(rec['filepath'], root_dir),
                 rec['format'],
                 rec['match_reason'],
+                _imtype_for_record(rec),
                 rec['dimensions'],
+                rec.get('archive_member', ''),
             ])
 
         for rec in pet_medium:
@@ -444,7 +608,9 @@ def write_results_to_csv(output_file, root_dir,
                 os.path.relpath(rec['filepath'], root_dir),
                 rec['format'],
                 rec['match_reason'],
+                _imtype_for_record(rec),
                 rec['dimensions'],
+                rec.get('archive_member', ''),
             ])
 
         if include_unclassified:
@@ -455,7 +621,9 @@ def write_results_to_csv(output_file, root_dir,
                     os.path.relpath(rec['filepath'], root_dir),
                     rec['format'],
                     rec['match_reason'],
+                    _imtype_for_record(rec),
                     rec['dimensions'],
+                    rec.get('archive_member', ''),
                 ])
 
         if include_non_structural:
@@ -466,15 +634,25 @@ def write_results_to_csv(output_file, root_dir,
                     os.path.relpath(rec['filepath'], root_dir),
                     rec['format'],
                     rec['match_reason'],
+                    _imtype_for_record(rec),
                     rec['dimensions'],
+                    rec.get('archive_member', ''),
                 ])
+
+        for rec in archives_unreadable:
+            writer.writerow([
+                'archive_unreadable',
+                root_dir,
+                os.path.relpath(rec['filepath'], root_dir),
+                '', rec['match_reason'], '', '', '',
+            ])
 
         for perm_path in permission_errors:
             writer.writerow([
                 'permission_denied',
                 root_dir,
                 os.path.relpath(perm_path, root_dir),
-                '', '', '',
+                '', '', '', '', '',
             ])
 
 
@@ -564,11 +742,16 @@ def main():
                         help='Include files with explicit non-structural indicators.')
     parser.add_argument('--skip-nibabel', action='store_true',
                         help='Skip nibabel header inspection (faster, less accurate).')
+    parser.add_argument('--skip-archives', action='store_true',
+                        help='Do not inspect archive files (.tar, .tar.gz, .zip, …) '
+                             'for neuroimaging members (faster, but misses archived files).')
     parser.add_argument('--permission-report', default=None,
                         help='Path for the permission-denied summary. '
                              'Defaults to <output_csv_stem>_permissions.txt')
     args = parser.parse_args()
-
+    #!#debug#!#
+    print(args.root_dir)
+    #!#debug#!#
     if not os.path.isdir(args.root_dir):
         print(f"Error: root directory does not exist: {args.root_dir}", file=sys.stderr)
         sys.exit(1)
@@ -586,19 +769,22 @@ def main():
 
     print(f"Searching for structural MRI and PET files in: {args.root_dir}")
     print(f"nibabel header inspection: {'enabled' if use_nibabel else 'disabled'}")
+    print(f"archive inspection:        {'enabled' if not args.skip_archives else 'disabled'}")
 
-    high_conf, medium_conf, unclassified_lst, non_structural, pet_high, pet_medium, permission_errors = \
+    inspect_archives = not args.skip_archives
+    high_conf, medium_conf, unclassified_lst, non_structural, pet_high, pet_medium, archives_unreadable, permission_errors = \
         find_structural_files(
             args.root_dir,
             use_nibabel=use_nibabel,
             include_unclassified=args.include_unclassified,
             include_non_structural=args.include_non_structural,
+            inspect_archives=inspect_archives,
         )
 
     write_results_to_csv(
         args.output_csv, args.root_dir,
         high_conf, medium_conf, unclassified_lst, non_structural,
-        pet_high, pet_medium, permission_errors,
+        pet_high, pet_medium, archives_unreadable, permission_errors,
         include_unclassified=args.include_unclassified,
         include_non_structural=args.include_non_structural,
     )
@@ -615,6 +801,7 @@ def main():
     n_non          = len(non_structural)
     n_pet_high     = len(pet_high)
     n_pet_medium   = len(pet_medium)
+    n_unreadable   = len(archives_unreadable)
     n_perm         = len(permission_errors)
 
     print()
@@ -626,8 +813,10 @@ def main():
     print(f'  pet_high                 : {n_pet_high}')
     print(f'  pet_medium               : {n_pet_medium}')
     print(f'  non_structural           : {n_non}   (--include-non-structural to write)')
+    print(f'  archive_unreadable       : {n_unreadable}')
     print(f'  permission_denied        : {n_perm}')
     print(f'  nibabel available        : {_HAS_NIBABEL}')
+    print(f'  archives inspected       : {inspect_archives}')
     print()
     print(f'Results written to: {args.output_csv}')
 

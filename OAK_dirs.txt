@@ -1,0 +1,16 @@
+/oak/stanford/groups/awagner/annakhaz
+/oak/stanford/groups/awagner/coreyf
+/oak/stanford/groups/awagner/ecog_temp
+/oak/stanford/groups/awagner/jfj
+/oak/stanford/groups/awagner/klarocqu
+/oak/stanford/groups/awagner/madore
+/oak/stanford/groups/awagner/marcharr
+/oak/stanford/groups/awagner/mthieu
+/oak/stanford/groups/awagner/nataliebiderman
+/oak/stanford/groups/awagner/sguerin
+/oak/stanford/groups/awagner/sgagnon
+/oak/stanford/groups/awagner/shaofang
+/oak/stanford/groups/awagner/smatsu
+/oak/stanford/groups/awagner/ttran
+/oak/stanford/groups/awagner/wagner
+/oak/stanford/groups/awagner/ziaW2A37
