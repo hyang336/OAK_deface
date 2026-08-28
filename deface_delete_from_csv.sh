@@ -27,6 +27,7 @@
 #       [--parallel_jobs 0] \
 #       [--array_chunk_size 4] \
 #       [--time 24:00:00] \
+#       [--rsync_time 24:00:00] \
 #       [--previous_job_id 12345] \
 #       [--dry_run]
 #
@@ -52,6 +53,9 @@
 #   --time HH:MM:SS        Wall-time limit for each deface/delete job.
 #                          Estimate ~10 min per NIfTI scan to be defaced.
 #                          [default: 24:00:00]
+#   --rsync_time HH:MM:SS  Wall-time limit for the optional per-root rsync
+#                          staging jobs when --working_dir is used.
+#                          [default: same as --time]
 #   --previous_job_id ID   SLURM job ID to depend on (afterok) before submitting
 #   --dry_run              Print what would be submitted without running sbatch
 #   --help, -h             Show this help and exit
@@ -67,6 +71,7 @@ imtype="AUTO"
 parallel_jobs="0"
 array_chunk_size="4"
 time_limit="24:00:00"
+rsync_time=""
 previous_job_id=""
 dry_run=false
 
@@ -80,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         --parallel_jobs)   parallel_jobs="$2";   shift 2 ;;
         --array_chunk_size) array_chunk_size="$2"; shift 2 ;;
         --time)            time_limit="$2";      shift 2 ;;
+        --rsync_time)      rsync_time="$2";      shift 2 ;;
         --previous_job_id) previous_job_id="$2"; shift 2 ;;
         --dry_run)         dry_run=true;         shift ;;
         --help|-h)
@@ -108,6 +114,10 @@ mkdir -p "$scratch_dir"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [[ -z "$rsync_time" ]]; then
+    rsync_time="$time_limit"
+fi
+
 dep_flag=""
 [[ -n "$previous_job_id" ]] && dep_flag="--dependency=afterok:${previous_job_id}"
 
@@ -118,6 +128,7 @@ echo "[INFO]: Scratch:     $scratch_dir"
 echo "[INFO]: imType:      $imtype"
 echo "[INFO]: parallel:    $parallel_jobs"
 echo "[INFO]: chunk_size:  $array_chunk_size"
+[[ -n "$working_dir" ]] && echo "[INFO]: rsync_time:   $rsync_time"
 $dry_run && echo "[INFO]: DRY RUN — no jobs will be submitted"
 
 count_member_entries() {
@@ -182,7 +193,7 @@ PYEOF
             --job-name="rsync_${root_basename}" \
             --output="/home/users/hyang336/jobs/rsync_${root_basename}_%j.out" \
             --error="/home/users/hyang336/jobs/rsync_${root_basename}_%j.err" \
-            --time=8:00:00 --mem=4G --cpus-per-task=2 \
+            --time="${rsync_time}" --mem=4G --cpus-per-task=2 \
             --partition=awagner,hns,normal \
             --wrap="rsync -a --info=progress2 '${root_path}/' '${dest}/'" \
             | awk '{print $4}')
@@ -204,6 +215,13 @@ fi
 
 job_ids=()
 n_skip=0
+
+# Regular (non-archive) files are grouped by root so we can submit one deface
+# array per root and one delete batch for the whole CSV.
+declare -A regular_deface_lists=()
+declare -a regular_deface_roots=()
+global_delete_list=""
+csv_tag="$(basename "${csv_file%.csv}")"
 
 # ---- Parse CSV and submit jobs -----------------------------------------------
 # Python parses the CSV and emits one record per job using ASCII delimiters:
@@ -230,32 +248,29 @@ while IFS=$'\x1c' read -r -d $'\x1d' action root rel_path deface_members delete_
         continue
     fi
 
-    # Derive a safe SLURM job name from the file/archive basename
-    _base="$(basename "${rel_path%.gz}")"
-    _base="${_base%.tar}"
-    job_name="ddel_$(echo "${_base}" | tr ' /.' '___' | cut -c1-38)"
-
-    if $dry_run; then
-        echo "[DRY-RUN]: ${job_name}  action=${action}"
-        echo "           file:   ${filepath}"
-        [[ -n "$deface_members" ]] && echo "           deface: ${deface_members}"
-        [[ -n "$delete_members" ]] && echo "           delete: ${delete_members}"
-        continue
-    fi
-
     # ARCHIVE member lists can be very long (one entry per archive member) and
     # exceed the OS ARG_MAX limit when passed directly on the command line.
     # Write them to files in scratch and pass the file paths instead.
-    arg_deface="$deface_members"
-    arg_delete="$delete_members"
     if [[ "$action" == "ARCHIVE" ]]; then
+        _base="$(basename "${rel_path%.gz}")"
+        _base="${_base%.tar}"
+        job_name="ddel_$(echo "${_base}" | tr ' /.' '___' | cut -c1-38)"
+
+        if $dry_run; then
+            echo "[DRY-RUN]: ${job_name}  action=${action}"
+            echo "           file:   ${filepath}"
+            [[ -n "$deface_members" ]] && echo "           deface: ${deface_members}"
+            [[ -n "$delete_members" ]] && echo "           delete: ${delete_members}"
+            continue
+        fi
+
+        arg_deface="$deface_members"
+        arg_delete="$delete_members"
         arg_deface="${scratch_dir}/${job_name}_deface.txt"
         arg_delete="${scratch_dir}/${job_name}_delete.txt"
         printf '%s' "$deface_members" > "$arg_deface"
         printf '%s' "$delete_members" > "$arg_delete"
-    fi
 
-    if [[ "$action" == "ARCHIVE" ]]; then
         archive_state_dir=$(mktemp -d "${scratch_dir}/${job_name}_state_XXXXXX")
         deface_count=$(count_member_entries "$arg_deface")
         array_limit=$(archive_array_concurrency "$parallel_jobs")
@@ -315,26 +330,31 @@ while IFS=$'\x1c' read -r -d $'\x1d' action root rel_path deface_members delete_
         continue
     fi
 
-    job_id=$(sbatch \
-        $dep_flag \
-        --job-name="${job_name}" \
-        --time="${time_limit}" \
-        --output="/home/users/hyang336/jobs/${job_name}_%j.out" \
-        --error="/home/users/hyang336/jobs/${job_name}_%j.err" \
-        "${SCRIPT_DIR}/deface_delete_job.sbatch" \
-        "$filepath" \
-        "$action" \
-        "$arg_deface" \
-        "$arg_delete" \
-        "$scratch_dir" \
-        "$mri_reface_sif" \
-        "${file_imtype:-$imtype}" \
-        | awk '{print $4}')
+    # Regular (non-archive) files are grouped by root.
+    root_slug="$(echo "${root}" | tr ' /.' '___' | cut -c1-60)"
+    root_job_name="ddel_${root_slug}"
 
-    echo "[INFO]: Submitted ${job_id} (${job_name}) — action=${action}  ${filepath}"
-    [[ -n "$deface_members" ]] && echo "        deface: ${deface_members}"
-    [[ -n "$delete_members" ]] && echo "        delete: ${delete_members}"
-    job_ids+=("${job_id}")
+    if [[ "$action" == "DEFACE" ]]; then
+        if [[ -z "${regular_deface_lists[$root]:-}" ]]; then
+            regular_deface_lists["$root"]="${scratch_dir}/${root_job_name}_deface_list.txt"
+            : > "${regular_deface_lists[$root]}"
+            regular_deface_roots+=("$root")
+        fi
+        printf '%s\t%s\n' "$filepath" "${file_imtype:-$imtype}" >> "${regular_deface_lists[$root]}"
+        continue
+    fi
+
+    if [[ "$action" == "DELETE" ]]; then
+        if [[ -z "$global_delete_list" ]]; then
+            global_delete_list="${scratch_dir}/${csv_tag}_delete_all.txt"
+            : > "$global_delete_list"
+        fi
+        printf '%s\n' "$filepath" >> "$global_delete_list"
+        continue
+    fi
+
+    echo "[ERROR]: Unsupported action for regular file: ${action}" >&2
+    exit 1
 
 done < <(python3 - "$csv_file" << 'PYEOF'
 import csv, sys, collections, os, re
@@ -429,6 +449,101 @@ for (root, rel), ops in archives.items():
 PYEOF
 )
 
+# Submit grouped regular-file jobs after the CSV has been fully parsed.
+regular_deface_jids=()
+if [[ ${#regular_deface_roots[@]} -gt 0 ]]; then
+    for root_path in "${regular_deface_roots[@]}"; do
+        list_file="${regular_deface_lists[$root_path]:-}"
+        [[ -n "$list_file" && -s "$list_file" ]] || continue
+
+        deface_count=$(grep -cve '^[[:space:]]*$' "$list_file" || true)
+        (( deface_count == 0 )) && continue
+
+        root_slug="$(echo "${root_path}" | tr ' /.' '___' | cut -c1-60)"
+        root_job_name="ddel_${root_slug}"
+        array_limit=$(archive_array_concurrency "$parallel_jobs")
+        task_count=$(( (deface_count + array_chunk_size - 1) / array_chunk_size ))
+
+        if $dry_run; then
+            echo "[DRY-RUN]: Would submit ${root_job_name}_a as array (${task_count} tasks x chunk ${array_chunk_size}, %${array_limit})"
+            echo "           deface list: ${list_file}"
+            continue
+        fi
+
+        deface_jid=$(sbatch \
+            $dep_flag \
+            --job-name="${root_job_name}_a" \
+            --time="${time_limit}" \
+            --array="0-$((task_count - 1))%${array_limit}" \
+            --output="/home/users/hyang336/jobs/${root_job_name}_array_%A_%a.out" \
+            --error="/home/users/hyang336/jobs/${root_job_name}_array_%A_%a.err" \
+            "${SCRIPT_DIR}/deface_delete_job.sbatch" \
+            "$root_path" \
+            "DEFACE_BATCH" \
+            "$list_file" \
+            "" \
+            "$scratch_dir" \
+            "$mri_reface_sif" \
+            "$imtype" \
+            "$array_chunk_size" \
+            | awk '{print $4}')
+
+        echo "[INFO]: Submitted ${deface_jid} (${root_job_name}_a) — deface array stage (${task_count} tasks x chunk ${array_chunk_size}, %${array_limit})"
+        job_ids+=("${deface_jid}")
+        regular_deface_jids+=("${deface_jid}")
+    done
+fi
+
+if [[ -n "$global_delete_list" && -s "$global_delete_list" ]]; then
+    if $dry_run; then
+        echo "[DRY-RUN]: Would submit one DELETE_BATCH job for ${global_delete_list}"
+    else
+        delete_dep="$dep_flag"
+        if [[ ${#regular_deface_jids[@]} -gt 0 ]]; then
+            deface_after="afterok:$(IFS=':'; echo "${regular_deface_jids[*]}")"
+            if [[ -n "$delete_dep" ]]; then
+                delete_dep="${delete_dep},${deface_after}"
+            else
+                delete_dep="--dependency=${deface_after}"
+            fi
+        fi
+
+        delete_jid=$(sbatch \
+            $delete_dep \
+            --job-name="ddel_${csv_tag}_delete" \
+            --time="${time_limit}" \
+            --output="/home/users/hyang336/jobs/ddel_${csv_tag}_delete_%j.out" \
+            --error="/home/users/hyang336/jobs/ddel_${csv_tag}_delete_%j.err" \
+            "${SCRIPT_DIR}/deface_delete_job.sbatch" \
+            "$csv_file" \
+            "DELETE_BATCH" \
+            "" \
+            "$global_delete_list" \
+            "$scratch_dir" \
+            "$mri_reface_sif" \
+            "$imtype" \
+            "1" \
+            | awk '{print $4}')
+
+        echo "[INFO]: Submitted ${delete_jid} (ddel_${csv_tag}_delete) — delete batch stage"
+        job_ids+=("${delete_jid}")
+    fi
+fi
+
 echo ""
 echo "[INFO]: Submitted ${#job_ids[@]} job(s), skipped ${n_skip} (non-actionable type)."
 [[ ${#job_ids[@]} -gt 0 ]] && echo "[INFO]: Job IDs: ${job_ids[*]}"
+
+if [[ ${#job_ids[@]} -gt 0 ]]; then
+    job_id_csv="$(IFS=','; echo "${job_ids[*]}")"
+    status_jid=$(sbatch \
+        --export="ALL,JOBIDS=${job_id_csv}" \
+        --dependency="afterany:${job_id_csv}" \
+        --job-name="ddel_${csv_tag}_status" \
+        --time="00:30:00" \
+        --output="/home/users/hyang336/jobs/ddel_${csv_tag}_status_%j.out" \
+        --error="/home/users/hyang336/jobs/ddel_${csv_tag}_status_%j.err" \
+        --wrap='set -euo pipefail; echo "[STATUS] Checking all monitored deface/delete jobs: ${JOBIDS}"; sacct -j "${JOBIDS}" --format=JobID,JobName,State,ExitCode --noheader || true; if sacct -j "${JOBIDS}" --format=State --noheader 2>/dev/null | grep -Eq "FAILED|CANCELLED|TIMEOUT|NODE_FAIL|PREEMPTED"; then echo "[STATUS] One or more deface/delete jobs failed or were canceled."; exit 1; else echo "[STATUS] No failed/canceled deface/delete jobs detected."; fi' \
+        | awk '{print $4}')
+    echo "[INFO]: Submitted ${status_jid} (ddel_${csv_tag}_status) — final job status summary"
+fi

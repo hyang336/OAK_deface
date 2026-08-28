@@ -22,6 +22,10 @@
 #              ANALYZE (.hdr): the paired .img sidecar is also deleted.
 #              NRRD (.nhdr):   only the header is deleted; a warning is logged
 #                              about any orphaned data file.
+#   DEFACE_BATCH — deface a newline-separated list of regular files in a SLURM
+#                  array, processing up to PARALLEL_JOBS files per task.
+#   DELETE_BATCH  — delete a newline-separated list of regular files in one
+#                  quick job.
 #   ARCHIVE  — extract the archive to scratch, apply DEFACE / DELETE to the
 #              listed members, repack, and overwrite the original archive.
 #
@@ -37,7 +41,8 @@
 #                        ARCHIVE with deface members).
 #   $7  IMTYPE           mri_reface -imType value  [default: AUTO]
 #   $8  PARALLEL_JOBS    Max number of archive members to deface concurrently
-#                        within this SLURM task. 0 means auto.
+#                        within this SLURM task, or batch chunk size for
+#                        DEFACE_BATCH. 0 means auto for ARCHIVE.
 
 set -euo pipefail
 
@@ -201,6 +206,62 @@ if [[ "$ACTION" == "DEFACE" ]]; then
 elif [[ "$ACTION" == "DELETE" ]]; then
 
     delete_file "$FILEPATH"
+
+# ---------------------------------------------------------------------------
+# ACTION: DEFACE_BATCH — deface multiple regular files in a SLURM array
+# ---------------------------------------------------------------------------
+elif [[ "$ACTION" == "DEFACE_BATCH" ]]; then
+
+    [[ -n "$DEFACE_MEMBERS" ]] || { echo "[ERROR]: DEFACE_BATCH requires deface members" >&2; exit 1; }
+    [[ "${SLURM_ARRAY_TASK_ID:-}" =~ ^[0-9]+$ ]] || { echo "[ERROR]: SLURM_ARRAY_TASK_ID required for DEFACE_BATCH" >&2; exit 1; }
+
+    batch_chunk_size="${PARALLEL_JOBS:-1}"
+    [[ "$batch_chunk_size" =~ ^[0-9]+$ ]] || batch_chunk_size=1
+    (( batch_chunk_size < 1 )) && batch_chunk_size=1
+
+    mapfile -t deface_arr <<< "$DEFACE_MEMBERS"
+    deface_lines=()
+    for entry in "${deface_arr[@]}"; do
+        [[ -z "${entry//[[:space:]]/}" ]] && continue
+        deface_lines+=("$entry")
+    done
+
+    total_deface=${#deface_lines[@]}
+    start_line=$(( SLURM_ARRAY_TASK_ID * batch_chunk_size ))
+    end_line=$(( start_line + batch_chunk_size - 1 ))
+    (( start_line >= total_deface )) && { echo "[INFO]: No batch members for task ${SLURM_ARRAY_TASK_ID}; exiting."; exit 0; }
+    (( end_line >= total_deface )) && end_line=$(( total_deface - 1 ))
+
+    echo "[INFO]: Deface batch task=${SLURM_ARRAY_TASK_ID} lines=${start_line}-${end_line} total=${total_deface} chunk=${batch_chunk_size}"
+
+    for ((idx=start_line; idx<=end_line; idx++)); do
+        entry="${deface_lines[$idx]}"
+        IFS=$'\t' read -r member_file member_imtype <<< "$entry"
+        [[ -z "$member_file" ]] && continue
+        [[ -z "$member_imtype" ]] && member_imtype="$IMTYPE"
+
+        [[ ! -f "$member_file" ]] && { echo "[ERROR]: File not found: ${member_file}" >&2; exit 1; }
+
+        work_dir=$(mktemp -d "${SCRATCH_DIR}/deface_work_XXXXXX")
+        trap "echo '[INFO]: Cleaning work dir'; rm -rf '${work_dir}'" EXIT
+        run_reface "$member_file" "$work_dir" "$member_imtype" "$THREADS"
+        rm -rf "$work_dir"
+        trap - EXIT
+    done
+
+# ---------------------------------------------------------------------------
+# ACTION: DELETE_BATCH — delete multiple regular files in one quick job
+# ---------------------------------------------------------------------------
+elif [[ "$ACTION" == "DELETE_BATCH" ]]; then
+
+    [[ -n "$DELETE_MEMBERS" ]] || { echo "[INFO]: No delete members provided; nothing to do."; exit 0; }
+
+    mapfile -t delete_arr <<< "$DELETE_MEMBERS"
+    for member in "${delete_arr[@]}"; do
+        [[ -z "${member//[[:space:]]/}" ]] && continue
+        echo "[INFO]: --- Deleting member: ${member} ---"
+        delete_file "$member"
+    done
 
 # ---------------------------------------------------------------------------
 # ACTION: ARCHIVE — extract, deface/delete members, repack in place
