@@ -12,7 +12,8 @@ Each file that is not plainly non-structural gets one action:
   ALIAS            symlink to another file in the dataset (handled there)
   REPORT_ONLY      anatomical but not refaced here (non-NIfTI, archive member,
                    unknown modality, symlink leaving the dataset, ...)
-  NO_FACE          mask / segmentation / skull-stripped / transform / stat map
+  NO_FACE          mask / segmentation / skull-stripped (by name or voxels) /
+                   transform / stat map / FreeSurfer derived / template
   UNCLASSIFIED     neuroimaging file with no anatomical evidence
 
 Nothing in TOP_DIR is modified.
@@ -42,7 +43,7 @@ import ar_classify as ac  # noqa: E402
 MANIFEST_COLUMNS = [
     'id', 'action', 'reason', 'rel_path', 'archive_member', 'format', 'category',
     'confidence', 'imtype', 'evidence', 'dimensions', 'voxel_mm', 'size_bytes',
-    'link_kind', 'link_target', 'duplicate_of', 'sha256',
+    'nonzero_ml', 'zero_frac', 'link_kind', 'link_target', 'duplicate_of', 'sha256',
 ]
 
 
@@ -140,13 +141,24 @@ def detect(top_dir, use_nibabel=True, inspect_archives=True):
             'voxel_mm': 'x'.join(f'{z:g}' for z in zooms[:3]) if zooms else '',
             'size_bytes': size, 'link_kind': link_kind, 'link_target': link_target,
             'link_reason': link_reason, 'duplicate_of': '', 'sha256': '',
-            'no_face': ac.no_face_reason(stem or '', os.path.dirname(name_path)),
+            'no_face': ac.no_face_reason(stem or '', os.path.dirname(name_path), fmt),
+            'nonzero_ml': '', 'zero_frac': '',
         }
         decision = decide(row)
         if decision is None:
             counts['non_structural'] += 1
             return
         row['action'], row['reason'] = decision
+        # mri_reface pastes a template face onto skull-stripped input, so check
+        # the voxels of every NIfTI that would be refaced or listed for review.
+        if (use_nibabel and row['action'] in ('REFACE', 'REPORT_ONLY') and fmt == 'NIfTI' and not member
+                and link_kind not in ('broken', 'external', 'hidden')):
+            stripped, nz_ml, zf = ac.skullstrip_check(os.path.join(top_dir, rel))
+            row['nonzero_ml'], row['zero_frac'] = nz_ml if nz_ml is not None else '', zf if zf is not None else ''
+            if stripped:
+                row['action'] = 'NO_FACE'
+                row['reason'] = (f'image appears skull-stripped ({nz_ml} mL nonzero, '
+                                 f'{zf:.0%} zero voxels)')
         rows.append(row)
 
     for dirpath, dirnames, filenames in os.walk(top_dir, onerror=onerror):

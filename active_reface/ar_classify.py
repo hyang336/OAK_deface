@@ -15,9 +15,11 @@ Successor to the regex rules in ../find_anat.py, used only by active_reface
   * A 3D NIfTI counts as structural on header evidence alone only when its
     voxels are fine (<= 1.5 mm); coarse 3D volumes with no other evidence are
     'unclassified' (typically stat maps or functional derivatives).
+  * BIDS names are parsed: the suffix (_T1w, _bold, _boldref, ...) decides,
+    and reference entities (space-T1w, from-/to-, mod-, res-, ...) are ignored.
   * Face-free derivatives (masks, segmentations, skull-stripped images,
-    transforms, stat maps, FreeSurfer label volumes) are recognised with
-    patterns anchored to the end of the name or to SPM/FSL prefixes.
+    transforms, stat maps, FreeSurfer derived/surface data, templates) are
+    recognised by name, and skull-stripped images also from their voxels.
 """
 
 import json
@@ -97,7 +99,7 @@ STRUCT_PATTERNS = [
     (tok('t2'), 'T2', 'medium'),
     (tok('flash|gre'), 'T1', 'medium'),
     (tok('anat|anatomy|anatomical|structural|struct|highres|hires|high_res|whole_?brain'), None, 'medium'),
-    (tok('localizer|localiser|scout|aahead|survey'), None, 'medium'),
+    (tok('localizer|localiser|loc|3_?plane|tri_?pilot|scout|aahead|survey|fgre'), None, 'medium'),
 ]
 
 PET_PATTERNS = [
@@ -120,10 +122,46 @@ NONSTRUCT_PATTERNS = [
     tok('bold|func|fmri|rest|resting|rsfmri|ep2d|epi|sbref'),
     tok('dwi|dti|diff|diffusion|tbss|hardi|dsi|fa|md|adc|trace'),
     tok('asl|pcasl|pasl|perf|perfusion|cbf'),
-    tok('fmap|fieldmap|field_?map|field_?mapping|b0map|topup|phasediff'),
+    tok('fmap|field_?map|field_?mapping|b0map|topup|phasediff'),
+    sub('fieldmap'),  # incl. GE fieldmaphz
+    sub('example_func|mean_func|filtered_func'),
 ]
 
 BIDS_NONSTRUCT_DIRS = {'func', 'dwi', 'fmap', 'perf', 'meg', 'eeg', 'ieeg', 'beh', 'motion', 'nirs'}
+
+# BIDS filenames: key-value entities followed by a suffix.  The suffix is
+# authoritative for the file type; these entities name a *reference* (target
+# space, source image, ...) rather than this image, e.g. space-T1w on a bold
+# run resampled to T1w space, so they are ignored when looking for evidence.
+_BIDS_ENTITY = re.compile(r'^([a-zA-Z0-9]+)-([a-zA-Z0-9+.]+)$')
+_REFERENCE_ENTITIES = {'sub', 'ses', 'task', 'run', 'echo', 'part', 'chunk', 'dir', 'inv', 'mt',
+                       'flip', 'space', 'from', 'to', 'mode', 'res', 'den', 'hemi', 'mod', 'cohort',
+                       'atlas', 'roi', 'seg', 'label', 'split', 'recording', 'sample', 'tpl'}
+BIDS_ANAT_SUFFIX = {'t1w': 'T1', 't2w': 'T2', 'flair': 'FLAIR', 'pdw': 'PD', 'pdt2': 'PD',
+                    't2starw': 'T2ST', 't2star': 'T2ST', 'megre': 'T2ST', 'mese': 'T2',
+                    'inplanet1': 'T1', 'inplanet2': 'T2', 'unit1': 'T1', 't1rho': 'T1',
+                    'angio': '', 't1map': '', 't2map': '', 't2starmap': '', 'r1map': '',
+                    'r2map': '', 'r2starmap': '', 'pdmap': '', 'mp2rage': '', 'mpm': '',
+                    'uniden': '', 'irt1': '', 'mtr': '', 'mtsat': ''}
+BIDS_NONSTRUCT_SUFFIX = {'bold', 'boldref', 'sbref', 'cbv', 'phase', 'dwi', 'dwiref', 'epi', 'asl',
+                         'aslcontext', 'm0scan', 'perf', 'cbf', 'att', 'phasediff', 'phase1',
+                         'phase2', 'magnitude', 'magnitude1', 'magnitude2', 'fieldmap', 'physio',
+                         'stim', 'events', 'timeseries', 'regressors', 'noise'}
+
+
+def parse_bids(stem):
+    """Return (entities [(key, value)], suffix) for a BIDS-style stem, else None."""
+    parts = stem.split('_')
+    if len(parts) < 2 or not re.fullmatch(r'[A-Za-z0-9]+', parts[-1]):
+        return None
+    ents = []
+    for e in parts[:-1]:
+        m = _BIDS_ENTITY.match(e)
+        if not m:
+            return None
+        ents.append((m.group(1).lower(), m.group(2)))
+    return ents, parts[-1]
+
 
 # Face-free derivatives.  Stem-end patterns; SPM/FSL prefixes; FreeSurfer names.
 _NO_FACE_END = re.compile(
@@ -142,21 +180,32 @@ _NO_FACE_ANY = [
     re.compile(r'(?<![a-z0-9])(?:res4d|sigmasquareds|mean_func|example_func|thresh_zstat\d*)$', re.IGNORECASE),
     re.compile(r'aparc', re.IGNORECASE),
 ]
-# FreeSurfer subject mri/ volumes without a face (orig, rawavg, nu, T1, T2,
-# FLAIR, 001.mgz keep the face).
-_FS_NO_FACE = {'brain', 'brainmask', 'brain.finalsurfs', 'brain.finalsurfs.manedit', 'aseg',
-               'aseg.auto', 'aseg.auto_noccseg', 'aseg.presurf', 'aseg.presurf.hypos', 'wm',
-               'wm.seg', 'wm.asegedit', 'filled', 'norm', 'ribbon', 'lh.ribbon', 'rh.ribbon',
-               'ctrl_pts', 'talairach.m3z', 'antsdn.brain', 'synthseg', 'surface.defects'}
+# FreeSurfer mri/ volumes that keep the face; every other volume in a
+# FreeSurfer subject's mri/ is derived (skull-stripped, segmentations, ...).
+_FS_FACE = {'orig', 'rawavg', 'nu', 't1', 't2', 'flair', 't2raw', 'flairraw', 'orig_nu'}
+_FS_DIRS = {'mri', 'surf', 'label', 'stats', 'transforms'}
+_TEMPLATE_DIR = re.compile(r'^(?:fsaverage\w*|cvs_avg35\w*|mni305|tpl-.*|templateflow)$', re.IGNORECASE)
 
 SIDECAR_TEXT_FIELDS = ('SeriesDescription', 'ProtocolName', 'SequenceName',
-                       'PulseSequenceDetails', 'PulseSequenceType')
+                       'PulseSequenceDetails', 'PulseSequenceType', 'ImageType')
 
 
-def no_face_reason(stem, rel_dir=''):
+def no_face_reason(stem, rel_dir='', fmt=''):
+    """Return why a file carries no participant face, or None."""
     base = os.path.basename(stem)
-    if os.path.basename(rel_dir).lower() == 'mri' and base.lower() in _FS_NO_FACE:
-        return 'FreeSurfer face-free volume'
+    parts = [p for p in re.split(r'[\\/]', rel_dir) if p]
+    lower = [p.lower() for p in parts]
+    if base.lower().startswith('tpl-') or any(_TEMPLATE_DIR.match(p) for p in parts):
+        return 'template image (not a participant)'
+    if 'transforms' in lower and 'mri' in lower:
+        return 'FreeSurfer transform/registration volume'
+    if fmt in ('MGH', 'MGZ') and ('surf' in lower or 'label' in lower):
+        return 'FreeSurfer surface/label data'
+    if fmt in ('MGH', 'MGZ') and 'mri' in lower:
+        in_orig = lower[-1] == 'orig' and re.fullmatch(r'\d{3}', base)
+        if not in_orig and base.lower() not in _FS_FACE:
+            return 'FreeSurfer derived volume (no face)'
+        return None
     if _NO_FACE_END.search(base):
         return f'face-free derivative ({_NO_FACE_END.search(base).group(0).strip("_-.")})'
     for pat in _NO_FACE_ANY:
@@ -164,6 +213,34 @@ def no_face_reason(stem, rel_dir=''):
         if m:
             return f'face-free derivative ({m.group(0)})'
     return None
+
+
+# Skull-stripped images: mostly exact zeros and too little tissue for a head.
+# Measured on fMRIPrep output: heads 8000 mL nonzero / 5% zeros; MNI-space
+# desc-preproc_T1w 2228 mL / 74% (its brain mask: 1905 mL).
+STRIPPED_ZERO_FRAC = 0.6
+STRIPPED_MAX_ML = 3000
+
+
+def skullstrip_check(path):
+    """Return (stripped, nonzero_ml, zero_frac) from the first volume, or (None, None, None)."""
+    if nib is None:
+        return None, None, None
+    try:
+        import numpy as np
+        img = nib.load(path)
+        obj = img.dataobj
+        data = np.asanyarray(obj[..., 0] if len(img.shape) > 3 else obj)
+        while data.ndim > 3:
+            data = data[..., 0]
+        nonzero = np.count_nonzero(data)
+        vox_ml = float(np.prod(img.header.get_zooms()[:3])) / 1000.0
+        nonzero_ml = nonzero * vox_ml
+        zero_frac = 1.0 - nonzero / data.size
+        return (zero_frac >= STRIPPED_ZERO_FRAC and nonzero_ml < STRIPPED_MAX_ML,
+                round(nonzero_ml), round(zero_frac, 2))
+    except Exception:
+        return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +301,33 @@ def classify(rel_path, fmt, shape=None, zooms=None, sidecar=None):
     parts = [p for p in re.split(r'[\\/]', os.path.dirname(rel_path)) if p]
     parent = parts[-1] if parts else ''
     dirs_lower = {p.lower() for p in parts}
-    side_text = ' | '.join(str(sidecar.get(k, '')) for k in SIDECAR_TEXT_FIELDS if sidecar.get(k))
+    side_text = ' | '.join(' '.join(map(str, v)) if isinstance(v, list) else str(v)
+                           for v in (sidecar.get(k) for k in SIDECAR_TEXT_FIELDS) if v)
     reasons = []
 
-    st_name = _scan(stem, STRUCT_PATTERNS)
-    pt_name = _scan(stem, PET_PATTERNS)
+    # BIDS names: the suffix decides; reference entities (space-T1w, from-, ...) are ignored.
+    bids = parse_bids(stem)
+    name_text = stem
+    if bids:
+        ents, suf = bids
+        sl = suf.lower()
+        if sl in BIDS_NONSTRUCT_SUFFIX:
+            return {'category': 'non_structural', 'confidence': '', 'imtype': '',
+                    'reasons': [f'BIDS suffix _{suf}']}
+        if sl == 'pet':
+            trc = dict(ents).get('trc', '') + ' ' + str(sidecar.get('TracerName', ''))
+            return {'category': 'pet', 'confidence': 'high',
+                    'imtype': _first_imtype(_scan(trc, PET_PATTERNS)), 'reasons': ['BIDS suffix _pet']}
+        if sl in BIDS_ANAT_SUFFIX:
+            imtype = BIDS_ANAT_SUFFIX[sl] or _first_imtype(_scan(side_text, STRUCT_PATTERNS))
+            return {'category': 'structural', 'confidence': 'high', 'imtype': imtype,
+                    'reasons': [f'BIDS suffix _{suf}']}
+        name_text = '_'.join([f'{k}-{v}' for k, v in ents if k not in _REFERENCE_ENTITIES] + [suf])
+        if name_text != stem:
+            reasons.append(f'BIDS name; evidence from "{name_text}"')
+
+    st_name = _scan(name_text, STRUCT_PATTERNS)
+    pt_name = _scan(name_text, PET_PATTERNS)
     st_side = _scan(side_text, STRUCT_PATTERNS) if side_text else []
     pt_side = _scan(side_text, PET_PATTERNS) if side_text else []
     st_dir = _scan(parent, STRUCT_PATTERNS) if parent else []
@@ -238,7 +337,7 @@ def classify(rel_path, fmt, shape=None, zooms=None, sidecar=None):
         pt_side.append((None, _first_imtype(_scan(tracer, PET_PATTERNS)), 'high'))
         reasons.append(f'sidecar PET (TracerName={tracer or "?"}, Modality={sidecar.get("Modality", "")})')
 
-    ns_name = [p for p in NONSTRUCT_PATTERNS if p.search(stem)]
+    ns_name = [p for p in NONSTRUCT_PATTERNS if p.search(name_text)]
     ns_side = [p for p in NONSTRUCT_PATTERNS if side_text and p.search(side_text)]
     ns_dir = sorted(dirs_lower & BIDS_NONSTRUCT_DIRS)
     in_anat = 'anat' in dirs_lower

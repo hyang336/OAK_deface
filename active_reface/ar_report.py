@@ -223,7 +223,8 @@ def build(run_dir):
         p.append(f'<div class="card" data-id="{esc(st["id"])}" data-rel="{esc(st["rel_path"])}" '
                  f'data-state="{esc(st["state"])}"><h3>{esc(st["rel_path"])}</h3>{badges}'
                  f'<span class="note">id {esc(st["id"])} · {esc(m.get("dimensions"))} @ '
-                 f'{esc(m.get("voxel_mm"))} mm · {st.get("elapsed_s", "")}s</span>'
+                 f'{esc(m.get("voxel_mm"))} mm · {esc(m.get("nonzero_ml"))} mL nonzero, '
+                 f'{esc(m.get("zero_frac"))} zero fraction · {st.get("elapsed_s", "")}s</span>'
                  f'<div class="note">evidence: {esc(m.get("evidence"))}</div>')
         if st.get('message'):
             p.append(f'<div class="warn">⚠ {esc(st["message"])}</div>')
@@ -263,7 +264,8 @@ def build(run_dir):
     cols = [('id', 'id'), ('path', 'rel_path'), ('archive member', 'archive_member'),
             ('format', 'format'), ('category', 'category'), ('conf.', 'confidence'),
             ('imType', 'imtype'), ('reason', 'reason'), ('evidence', 'evidence'),
-            ('dims', 'dimensions'), ('voxel mm', 'voxel_mm')]
+            ('dims', 'dimensions'), ('voxel mm', 'voxel_mm'), ('nonzero mL', 'nonzero_ml'),
+            ('zero frac', 'zero_frac')]
 
     # ---- report only ----
     p.append(f'<h2>3. Anatomical scans not refaced ({len(groups["REPORT_ONLY"])})</h2>')
@@ -279,7 +281,9 @@ def build(run_dir):
             ('DUPLICATE', 'Identical copies', 'Byte-identical to a scan in section 1; they follow its decision.'),
             ('ALIAS', 'Symlinks to other files in the dataset', 'The target file is handled directly.'),
             ('NO_FACE', 'Face-free derivatives',
-             'Masks, segmentations, skull-stripped images, transforms and statistical maps. '
+             'Masks, segmentations, skull-stripped images (by name, or by voxels: mostly zeros '
+             'and under 3000 mL of tissue), transforms, statistical maps, FreeSurfer derived and '
+             'surface files, and templates. '
              'Spot-check that none of these still contain a face.'),
             ('UNCLASSIFIED', 'Unclassified neuroimaging files',
              'No anatomical evidence in name, sidecar or header (e.g. coarse-resolution maps). '

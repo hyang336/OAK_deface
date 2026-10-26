@@ -42,16 +42,20 @@ Functional, diffusion, fieldmap and perfusion files are counted but not listed.
 `ar_classify.py` replaces `find_anat.py`'s rules for this pipeline only; the legacy scripts keep their own.
 
 - **Formats:** `.nii`/`.nii.gz`, `.mnc`/`.mnc.gz`/`.mnc2`, `.mgh`/`.mgz`, `.nrrd`/`.nhdr` and ANALYZE `.hdr`, plus their members inside tar/zip archives (by name). Hidden files and directories are skipped, and symlinked directories are not followed (they're listed in `run_info.json`).
+- **BIDS names** (`key-value_…_suffix`): the suffix decides. `_T1w`, `_T2w`, `_FLAIR`, … are anatomical; `_bold`, `_boldref`, `_sbref`, `_dwi`, `_epi`, fieldmap and ASL suffixes are non-structural; `_pet` is PET. Entities that name a reference rather than the image (`space-`, `from-`/`to-`, `mod-`, `res-`, `den-`, `task-`, …) are ignored, so `…_space-T1w_boldref` is functional.
 - **Tokens:** anything other than a letter or digit separates words, so `T1_MPRAGE_SAG_0003` matches both `T1` and `MPRAGE`. Long sequence names (MPRAGE, MP2RAGE, SPGR, BRAVO, FLAIR, tracer names) also match inside longer words.
 - **Evidence** comes from the filename, the parent directory, BIDS datatype directories (`anat/`, `pet/`, `func/`, `dwi/`, `fmap/`, `perf/`, …), the JSON sidecar (`SeriesDescription`, `ProtocolName`, `SequenceName`, `PulseSequenceDetails`, `TracerName`, `Modality`) and the NIfTI header (shape, voxel size).
-- **Decision order:**
+- **Regression tests:** `python test_ar_classify.py` checks the rules against real-world names. Add a case whenever a dataset turns up a misclassification.
+- **Decision order** (for non-BIDS names, or BIDS suffixes not listed above):
   1. Explicit functional/diffusion/fieldmap/perfusion markers mean non-structural, unless the filename itself names an anatomical sequence or a PET tracer.
   2. A 4D volume is non-structural only if nothing marks it as anatomical or PET. Multi-echo MEMPRAGE and dynamic PET are kept.
   3. PET evidence means PET. This is checked before structural because co-registered PET often has `T1` in its name.
   4. Structural evidence means structural: high confidence for an `anat/` directory, a BIDS suffix, a sequence name in the filename or a sidecar hit; medium confidence for a generic token like `T1` or `struct`.
   5. With no name or sidecar evidence, a 3D NIfTI with voxels ≤ 1.5 mm counts as structural with unknown modality (`REPORT_ONLY`). Coarser volumes are `UNCLASSIFIED`.
 - **imType** comes from the filename, then the sidecar, then a parent directory with a sequence name (e.g. `T1_MPRAGE_0003/`). Bare `T1`/`T2` directory names are ignored because they are often timepoints. Check the imType badge on each card: a wrong imType usually shows up as a failed or poor reface.
-- **Face-free derivatives** are matched at the end of the name (`_mask`, `_dseg`, `_probseg`, `_brain`, `_xfm`, `_warp`, …), by entities (`desc-brain`, `label-`), by SPM/FSL forms (`c1…`, `wc1…`, `y_…`, `zstat1`, `cope3`, `spmT_0001`, `con_0002`, …) and by FreeSurfer `mri/` names (`brain`, `brainmask`, `aseg`, `norm`, `wm`, …). FreeSurfer `orig`, `rawavg`, `nu` and `T1` keep the face and are listed in section 3.
+- **Skull-stripped images are also caught from their voxels:** a NIfTI that would be refaced or listed is read, and if ≥ 60% of voxels are exactly zero and the nonzero volume is under 3,000 mL, it becomes `NO_FACE`. (`mri_reface` pastes a template face onto skull-stripped input.) On fMRIPrep output, head images measured ~8,000 mL / 5% zeros, and a skull-stripped MNI-space `desc-preproc_T1w` measured 2,228 mL / 74%. Both numbers are shown on each report card and in the tables.
+- **FreeSurfer:** template subjects (`fsaverage*`, `cvs_avg35`) and TemplateFlow `tpl-*` files are not participants. `surf/`, `label/` and `mri/transforms/` files have no face. In a subject's `mri/`, only `orig`, `rawavg`, `nu`, `T1`, `T2`, `FLAIR` and `orig/00N` are treated as having a face (`REPORT_ONLY`); everything else there is derived.
+- **Face-free derivatives** are matched at the end of the name (`_mask`, `_dseg`, `_probseg`, `_brain`, `_xfm`, `_warp`, …), by entities (`desc-brain`, `label-`), by SPM/FSL forms (`c1…`, `wc1…`, `y_…`, `zstat1`, `cope3`, `spmT_0001`, `con_0002`, …) and and by the FreeSurfer rules above.
 
 ## Usage
 
